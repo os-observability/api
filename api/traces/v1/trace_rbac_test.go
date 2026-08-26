@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/go-kit/log"
+	"github.com/golang/protobuf/proto" //nolint:staticcheck
 	"github.com/grafana/tempo/pkg/tempopb"
 	commonv1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	resourcev1 "github.com/grafana/tempo/pkg/tempopb/resource/v1"
@@ -826,6 +828,156 @@ func TestResponseRBACModifier(t *testing.T) {
 		require.NoError(t, modifier(resp))
 
 		body, _ := io.ReadAll(resp.Body)
+		assert.Equal(t, []string{fmt.Sprint(len(body))}, resp.Header["Content-Length"])
+		assert.Empty(t, resp.Header["Content-Encoding"])
+	})
+}
+
+func makeProtobufResponse(ctx context.Context, statusCode int, path string, pb proto.Message) *http.Response {
+	b, err := proto.Marshal(pb)
+	if err != nil {
+		panic(err)
+	}
+	return &http.Response{
+		StatusCode: statusCode,
+		Header:     http.Header{"Content-Type": []string{"application/protobuf"}},
+		Body:       io.NopCloser(bytes.NewReader(b)),
+		Request:    (&http.Request{URL: &url.URL{Path: path}}).WithContext(ctx),
+	}
+}
+
+func TestResponseRBACModifierProtobuf(t *testing.T) {
+	modifier := responseRBACModifier(log.NewNopLogger())
+	ctx := contextWithAllowedNamespaces(t, []string{"allowed-ns"})
+
+	t.Run("v1 trace endpoint protobuf", func(t *testing.T) {
+		trace := &tempopb.Trace{
+			ResourceSpans: []*tracev1.ResourceSpans{
+				{
+					Resource: &resourcev1.Resource{
+						Attributes: []*commonv1.KeyValue{
+							createStringAttribute("k8s.namespace.name", "allowed-ns"),
+						},
+					},
+					ScopeSpans: []*tracev1.ScopeSpans{
+						{Scope: &commonv1.InstrumentationScope{}, Spans: []*tracev1.Span{
+							{Attributes: []*commonv1.KeyValue{createStringAttribute("span1", "val")}},
+						}},
+					},
+				},
+				{
+					Resource: &resourcev1.Resource{
+						Attributes: []*commonv1.KeyValue{
+							createStringAttribute("k8s.namespace.name", "blocked-ns"),
+							createStringAttribute("service.name", "blocked-svc"),
+						},
+					},
+					ScopeSpans: []*tracev1.ScopeSpans{
+						{Scope: &commonv1.InstrumentationScope{}, Spans: []*tracev1.Span{
+							{Attributes: []*commonv1.KeyValue{createStringAttribute("span2", "val")}},
+						}},
+					},
+				},
+			},
+		}
+
+		resp := makeProtobufResponse(ctx, http.StatusOK, "/api/traces/abc123", trace)
+		require.NoError(t, modifier(resp))
+
+		body, _ := io.ReadAll(resp.Body)
+		result := &tempopb.Trace{}
+		require.NoError(t, proto.Unmarshal(body, result))
+
+		assert.Len(t, result.ResourceSpans, 2)
+		assert.Len(t, result.ResourceSpans[0].ScopeSpans[0].Spans[0].Attributes, 1, "allowed span keeps attributes")
+		assert.Empty(t, result.ResourceSpans[1].ScopeSpans[0].Spans[0].Attributes, "blocked span attributes stripped")
+		assert.Empty(t, result.ResourceSpans[1].ScopeSpans[0].Spans[0].Events, "blocked span events stripped")
+		assert.Len(t, result.ResourceSpans[1].Resource.Attributes, 2, "blocked resource keeps namespace and service.name")
+		assert.Equal(t, "k8s.namespace.name", result.ResourceSpans[1].Resource.Attributes[0].Key)
+		assert.Equal(t, "service.name", result.ResourceSpans[1].Resource.Attributes[1].Key)
+		assert.Equal(t, []string{fmt.Sprint(len(body))}, resp.Header["Content-Length"])
+		assert.Empty(t, resp.Header["Content-Encoding"])
+	})
+
+	t.Run("v2 trace endpoint protobuf", func(t *testing.T) {
+		traceByIDResp := &tempopb.TraceByIDResponse{
+			Trace: &tempopb.Trace{
+				ResourceSpans: []*tracev1.ResourceSpans{
+					{
+						Resource: &resourcev1.Resource{
+							Attributes: []*commonv1.KeyValue{
+								createStringAttribute("k8s.namespace.name", "allowed-ns"),
+							},
+						},
+						ScopeSpans: []*tracev1.ScopeSpans{
+							{Scope: &commonv1.InstrumentationScope{}, Spans: []*tracev1.Span{
+								{Attributes: []*commonv1.KeyValue{createStringAttribute("span1", "val")}},
+							}},
+						},
+					},
+					{
+						Resource: &resourcev1.Resource{
+							Attributes: []*commonv1.KeyValue{
+								createStringAttribute("k8s.namespace.name", "blocked-ns"),
+								createStringAttribute("service.name", "blocked-svc"),
+							},
+						},
+						ScopeSpans: []*tracev1.ScopeSpans{
+							{Scope: &commonv1.InstrumentationScope{}, Spans: []*tracev1.Span{
+								{Attributes: []*commonv1.KeyValue{createStringAttribute("span2", "val")}},
+							}},
+						},
+					},
+				},
+			},
+		}
+
+		resp := makeProtobufResponse(ctx, http.StatusOK, "/api/v2/traces/abc123", traceByIDResp)
+		require.NoError(t, modifier(resp))
+
+		body, _ := io.ReadAll(resp.Body)
+		result := &tempopb.TraceByIDResponse{}
+		require.NoError(t, proto.Unmarshal(body, result))
+
+		assert.Len(t, result.Trace.ResourceSpans[0].ScopeSpans[0].Spans[0].Attributes, 1, "allowed span keeps attributes")
+		assert.Empty(t, result.Trace.ResourceSpans[1].ScopeSpans[0].Spans[0].Attributes, "blocked span attributes stripped")
+		assert.Equal(t, []string{fmt.Sprint(len(body))}, resp.Header["Content-Length"])
+		assert.Empty(t, resp.Header["Content-Encoding"])
+	})
+
+	t.Run("search endpoint protobuf", func(t *testing.T) {
+		searchResp := &tempopb.SearchResponse{
+			Traces: []*tempopb.TraceSearchMetadata{
+				{
+					SpanSets: []*tempopb.SpanSet{
+						{
+							Spans: []*tempopb.Span{
+								{Attributes: []*commonv1.KeyValue{
+									createStringAttribute("k8s.namespace.name", "allowed-ns"),
+									createStringAttribute("extra", "val"),
+								}},
+								{Attributes: []*commonv1.KeyValue{
+									createStringAttribute("k8s.namespace.name", "blocked-ns"),
+									createStringAttribute("extra", "val"),
+								}},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		resp := makeProtobufResponse(ctx, http.StatusOK, "/api/search", searchResp)
+		require.NoError(t, modifier(resp))
+
+		body, _ := io.ReadAll(resp.Body)
+		result := &tempopb.SearchResponse{}
+		require.NoError(t, proto.Unmarshal(body, result))
+
+		spans := result.Traces[0].SpanSets[0].Spans
+		assert.Len(t, spans[0].Attributes, 2, "allowed span keeps all attributes")
+		assert.Len(t, spans[1].Attributes, 1, "blocked span keeps only namespace")
+		assert.Equal(t, "k8s.namespace.name", spans[1].Attributes[0].Key)
 		assert.Equal(t, []string{fmt.Sprint(len(body))}, resp.Header["Content-Length"])
 		assert.Empty(t, resp.Header["Content-Encoding"])
 	})
